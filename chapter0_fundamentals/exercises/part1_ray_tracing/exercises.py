@@ -709,9 +709,99 @@ num_frames = 50
 
 rays = make_rays_2d(num_pixels_y, num_pixels_z, y_limit, z_limit)
 rays[:, 0] = t.tensor([-3.0, 0.0, 0.0])
-dists = raytrace_mesh_video(rays, triangles, rotation_matrix, raytrace_mesh, num_frames)
-dists = einops.rearrange(dists, "frames (y z) -> frames y z", y=num_pixels_y)
+# dists = raytrace_mesh_video(rays, triangles, rotation_matrix, raytrace_mesh, num_frames)
+# dists = einops.rearrange(dists, "frames (y z) -> frames y z", y=num_pixels_y)
 
+# display_video(dists)
+
+
+# %%
+
+def linalg_solve(mat: Tensor, vec: Tensor, max_batch: int = 300_000) -> Tensor:
+    """
+    Drop-in replacement for `t.linalg.solve(mat, vec)` that chunks the batch so
+    each underlying call stays below the hipBLAS workspace ceiling on
+    ROCm/gfx1151, where large batches fail with HIPBLAS_STATUS_ALLOC_FAILED.
+
+    mat: (..., n, n)  — any leading batch dimensions
+    vec: (..., n)
+    Returns the same result as t.linalg.solve(mat, vec).
+    """
+    assert mat.shape[:-2] == vec.shape[:-1], (
+        f"batch dims must match (no broadcasting): {mat.shape[:-2]} vs {vec.shape[:-1]}"
+    )
+    batch_shape = mat.shape[:-2]
+    n = mat.shape[-1]
+
+    mat_flat = mat.reshape(-1, n, n)
+    vec_flat = vec.reshape(-1, n)
+    total = mat_flat.shape[0]
+
+    if total <= max_batch:
+        return t.linalg.solve(mat, vec)
+
+    out = t.empty_like(vec_flat)
+    for i in range(0, total, max_batch):
+        out[i : i + max_batch] = t.linalg.solve(
+            mat_flat[i : i + max_batch], vec_flat[i : i + max_batch]
+        )
+    return out.reshape(*batch_shape, n)
+
+
+# %%
+
+def raytrace_mesh_gpu(
+    rays: Float[Tensor, "nrays rayPoints=2 dims=3"],
+    triangles: Float[Tensor, "ntriangles trianglePoints=3 dims=3"],
+) -> Float[Tensor, " nrays"]:
+    """
+    For each ray, return the distance to the closest intersecting triangle, or infinity.
+
+    All computations should be performed on the GPU.
+    """
+    NR = rays.size(0)
+    NT = triangles.size(0)
+    device = "cuda"
+    triangles = triangles.to(device)
+    rays = rays.to(device)
+
+    # Each triangle is [[Ax, Ay, Az], [Bx, By, Bz], [Cx, Cy, Cz]]
+    triangles = einops.repeat(triangles, "NT pts dims -> pts NR NT dims", NR=NR)
+    A, B, C = triangles
+    assert A.shape == (NR, NT, 3)
+
+    # Each ray is [[Ox, Oy, Oz], [Dx, Dy, Dz]]
+    rays = einops.repeat(rays, "NR pts dims -> pts NR NT dims", NT=NT)
+    O, D = rays
+    assert O.shape == (NR, NT, 3)
+
+    # Define matrix on left hand side of equation
+    mat: Float[Tensor, "NR NT 3 3"] = t.stack([-D, B - A, C - A], dim=-1)
+    # Get boolean of where matrix is singular, and replace it with the identity in these positions
+    dets: Float[Tensor, "NR NT"] = t.linalg.det(mat)
+    is_singular = dets.abs() < 1e-8
+    mat[is_singular] = t.eye(3).to(device)
+
+    # Define vector on the right hand side of equation
+    vec: Float[Tensor, "NR NT 3"] = O - A
+
+    # Solve eqns (note, s is the distance along ray)
+    sol: Float[Tensor, "NR NT 3"] = linalg_solve(mat, vec)
+    s, u, v = sol.unbind(-1)
+
+    # Scale s by Dx to get the distance along ray
+    s *= D[..., 0]
+
+    # Get boolean of intersects, and use it to set distance = infinity when there is no intersection
+    intersects = (s >= 0) & (u >= 0) & (v >= 0) & (u + v <= 1) & ~is_singular
+    s[~intersects] = t.inf
+
+    # Get the minimum distance (over all triangles) for each ray
+    return einops.reduce(s, "NR NT -> NR", "min").cpu()
+
+
+dists = raytrace_mesh_video(rays, triangles, rotation_matrix, raytrace_mesh_gpu, num_frames)
+dists = einops.rearrange(dists, "frames (y z) -> frames y z", y=num_pixels_y)
 display_video(dists)
 
 # %%
