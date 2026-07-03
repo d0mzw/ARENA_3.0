@@ -439,3 +439,60 @@ render_lines_with_plotly(rays_2d)
 
 # %%
 
+one_triangle = t.tensor([[0, 0, 0], [4, 0.5, 0], [2, 3, 0]])
+A, B, C = one_triangle
+x, y, z = one_triangle.T
+
+fig: go.FigureWidget = setup_widget_fig_triangle(x, y, z)
+display(fig)
+
+
+@interact(u=(-0.5, 1.5, 0.01), v=(-0.5, 1.5, 0.01))
+def update(u=0.0, v=0.0):
+    P = A + u * (B - A) + v * (C - A)
+    fig.update_traces({"x": [P[0]], "y": [P[1]]}, 2)
+
+# %%
+
+Point = Float[Tensor, "points=3"]
+
+def triangle_ray_intersects(A: Point, B: Point, C: Point, O: Point, D: Point) -> bool:
+    """
+    A: shape (3,), one vertex of the triangle
+    B: shape (3,), second vertex of the triangle
+    C: shape (3,), third vertex of the triangle
+    O: shape (3,), origin point
+    D: shape (3,), direction point
+
+    Return True if the ray and the triangle intersect.
+    """
+    print(f"{A=}")
+    print(f"{A.shape=}")
+    print(f"{B=}")
+    print(f"{B.shape=}")
+    print(f"{C=}")
+    print(f"{C.shape=}")
+
+    print(f"{O=}")
+    print(f"{O.shape=}")
+    print(f"{D=}")
+    print(f"{D.shape=}")
+
+    matrix = t.stack([-D, (B - A), (C - A)], dim=1)
+    print(matrix)
+
+    try:
+        sol = t.linalg.solve(matrix, O - A)
+    except RuntimeError:
+        return False
+    print(sol)
+
+    s = sol[0]
+    u = sol[1]
+    v = sol[2]
+
+    return ((0 <= u) & (0 <= v) & ((u + v) <= 1) & (s >= 0)).item()
+
+tests.test_triangle_ray_intersects(triangle_ray_intersects)
+
+# %%
