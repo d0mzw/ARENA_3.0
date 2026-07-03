@@ -548,3 +548,98 @@ img = intersects.reshape(num_pixels_y, num_pixels_z).int()
 imshow(img, origin="lower", width=600, title="Triangle (as intersected by rays)")
 
 # %%
+triangles = t.load(section_dir / "pikachu.pt", weights_only=True)
+
+def raytrace_mesh(
+    rays: Float[Tensor, "nrays rayPoints=2 dims=3"],
+    triangles: Float[Tensor, "ntriangles trianglePoints=3 dims=3"],
+) -> Float[Tensor, " nrays"]:
+    """
+    For each ray, return the distance to the closest intersecting triangle, or infinity.
+    """
+
+    # torch.Size([14400, 2, 3])
+    # print(rays.shape)
+
+    # [
+    #     [O_x, O_y, O_z], [D_x, D_y, D_z]
+    # ],
+    # [
+    #     [O_x, O_y, O_z], [D_x, D_y, D_z]
+    # ],
+    # ...
+
+    nrays = rays.shape[0]
+    ntrigs = triangles.shape[0]
+
+    O = rays[:, 0, :]
+    D = rays[:, 1, :]
+
+    # torch.Size([14400, 3])
+    print(O.shape)
+    # [
+    #     [O_x, O_y, O_z]
+    # ],
+    # ...
+
+    print(triangles.shape)
+
+    # [
+    #     [A_x, A_y, A_z],  [B_x, B_y, B_z], [C_x, C_y, C_z],
+    # ],
+    # [
+    #     [A_x, A_y, A_z],  [B_x, B_y, B_z], [C_x, C_y, C_z],
+    # ],
+    # ...
+
+    # torch.Size([412, 3])
+    A = triangles[:, 0, :]
+    B = triangles[:, 1, :]
+    C = triangles[:, 2, :]
+
+    print(A.shape)
+    # [
+    #     [A_x, A_y, A_z]
+    # ],
+    # ...
+
+    O = einops.repeat(O, "nrays xyz -> nrays ntrigs xyz", ntrigs=ntrigs)
+    D = einops.repeat(D, "nrays xyz -> nrays ntrigs xyz", ntrigs=ntrigs)
+
+    A = einops.repeat(A, "ntrigs xyz -> nrays ntrigs xyz", nrays=nrays)
+    B = einops.repeat(B, "ntrigs xyz -> nrays ntrigs xyz", nrays=nrays)
+    C = einops.repeat(C, "ntrigs xyz -> nrays ntrigs xyz", nrays=nrays)
+    
+    matrix = t.stack([-D, (B - A), (C - A)], dim=-1)
+    print(matrix[0][0])
+
+    dets = t.linalg.det(matrix)
+    singular = dets.abs() < 1e-8
+    matrix[singular] = t.eye(3)
+
+    sol = t.linalg.solve(matrix, O - A)
+    s, u, v = sol.unbind(dim=-1)
+
+    intersects  = (s >= 0) & (u >= 0) & (v >= 0) & (u + v <= 1) & ~singular
+    s[~intersects ] = float("inf")
+    return s.min(dim=-1).values
+
+
+num_pixels_y = 120
+num_pixels_z = 120
+y_limit = z_limit = 1
+
+rays = make_rays_2d(num_pixels_y, num_pixels_z, y_limit, z_limit)
+rays[:, 0] = t.tensor([-2, 0.0, 0.0])
+dists = raytrace_mesh(rays, triangles)
+intersects = t.isfinite(dists).view(num_pixels_y, num_pixels_z)
+dists_square = dists.view(num_pixels_y, num_pixels_z)
+img = t.stack([intersects, dists_square], dim=0)
+
+fig = px.imshow(img, facet_col=0, origin="lower", color_continuous_scale="magma", width=1000)
+fig.update_layout(coloraxis_showscale=False)
+for i, text in enumerate(["Intersects", "Distance"]):
+    fig.layout.annotations[i]["text"] = text
+fig.show()
+
+# %%
