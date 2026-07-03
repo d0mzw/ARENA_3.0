@@ -80,7 +80,7 @@ mujoco
 # GPU physics for the MuJoCo section (Brax `positional` backend + our torch PPO). Pinned because
 # brax only declares `jax>=0.4.6` (no upper bound), so an unpinned install grabs a newer jax whose
 # removed `device_put_replicated` breaks brax. jax 0.10.1 is the verified-working combo.
-jax[cuda12]==0.10.1
+# jax[cuda12]==0.10.1
 brax==0.14.2
 # Vectorised Atari emulators (C++) for the Atari bonus section's AtariEnvs.
 envpool==1.2.5
