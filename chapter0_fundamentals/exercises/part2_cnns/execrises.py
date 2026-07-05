@@ -38,18 +38,14 @@ from plotly_utils import line
 
 # %%
 
-
 class ReLU(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
-
         # m = nn.ReLU()
         # return m(x)
 
         return t.maximum(x, t.tensor(0))
 
-
 tests.test_relu(ReLU)
-
 
 # %%
 class Linear(nn.Module):
@@ -80,11 +76,12 @@ class Linear(nn.Module):
 
         weight = sf * sample
 
-        self.weight = weight
+        self.weight = nn.Parameter(weight)
         self.bias = None
 
         if bias:
-            self.bias = sf * (2 * t.rand(out_features) - 1)
+            bias = sf * (2 * t.rand(out_features) - 1)
+            self.bias = nn.Parameter(bias)
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -92,15 +89,31 @@ class Linear(nn.Module):
         Return: shape (*, out_features)
         """
         
-        pass
+        # e.g. in_features=3, out_features=2
+        # self.weight.shape = (out_features, in_features) = (2, 3)
 
+        # [[w00, w01, w02],    <- row 0 (produces output 0)
+        #  [w10, w11, w12]]    <- row 1 (produces output 1)
+
+        # The output is 2 numbers:
+        # out0 = w00*x0 + w01*x1 + w02*x2    (row 0 of weight, dotted with x)
+        # out1 = w10*x0 + w11*x1 + w12*x2    (row 1 of weight, dotted with x)
+
+        x = einops.einsum(x, self.weight, "... in_features, out_features in_features -> ... out_features")
+        
+        if self.bias is not None:
+            x += self.bias
+
+        return x
 
 
     def extra_repr(self) -> str:
-        raise NotImplementedError()
+        return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}"
 
 
 tests.test_linear_parameters(Linear, bias=False)
 tests.test_linear_parameters(Linear, bias=True)
 tests.test_linear_forward(Linear, bias=False)
 tests.test_linear_forward(Linear, bias=True)
+
+# %%
