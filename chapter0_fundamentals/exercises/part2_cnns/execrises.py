@@ -117,3 +117,66 @@ tests.test_linear_forward(Linear, bias=False)
 tests.test_linear_forward(Linear, bias=True)
 
 # %%
+
+class Flatten(nn.Module):
+    def __init__(self, start_dim: int = 1, end_dim: int = -1) -> None:
+        super().__init__()
+
+        self.start_dim = start_dim
+        self.end_dim = end_dim
+
+    def forward(self, input: Tensor) -> Tensor:
+
+        # A batch of 64 images, each 3 channels, 28×28 pixels
+        # input.shape = (64, 3, 28, 28)
+        # dim_0 = 64, dim_1 = 3, dim_2 = 28, dim_3 = 28
+        shape = input.shape
+
+        # Get start & end dims, handling negative indexing for end dim
+        # start_dim = 1, end_dim = -1
+        start_dim = self.start_dim
+
+        # end_dim = 4 + (-1) = 3
+        end_dim = self.end_dim if self.end_dim >= 0 else len(shape) + self.end_dim
+
+        # Get the shapes to the left / right of flattened dims, as well as size of flattened middle
+        
+        # shape[:1] = (64,)
+        shape_left = shape[:start_dim]
+
+        # shape[4:] = ()
+        shape_right = shape[end_dim + 1 :]
+        
+        # shape[1:4] = (3, 28, 28) are the dims we're flattening
+        # t.tensor((3, 28, 28)) turns that tuple into a tensor [3, 28, 28]
+        # t.prod multiplies all its elements together: 3 * 28 * 28 = 2352
+        # .item() pulls that out as int: shape_middle = 2352
+        shape_middle = t.prod(t.tensor(shape[start_dim : end_dim + 1])).item()
+
+
+        # shape_left      = (64,)
+        # (shape_middle,) = (2352,)
+        # shape_right     = ()
+        return t.reshape(input, shape_left + (shape_middle,) + shape_right)
+
+    def extra_repr(self) -> str:
+        return ", ".join([f"{key}={getattr(self, key)}" for key in ["start_dim", "end_dim"]])
+# %%
+
+class SimpleMLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.flatten = Flatten()
+        self.linear1 = Linear(in_features=28 * 28, out_features=100)
+        self.relu = ReLU()
+        self.linear2 = Linear(in_features=100, out_features=10)
+
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.linear2(self.relu(self.linear1(self.flatten(x))))
+
+
+tests.test_mlp_module(SimpleMLP)
+tests.test_mlp_forward(SimpleMLP)
+
+# %%
