@@ -180,3 +180,225 @@ tests.test_mlp_module(SimpleMLP)
 tests.test_mlp_forward(SimpleMLP)
 
 # %%
+
+# Transform = per-image preprocessing pipeline, applied to every image.
+MNIST_TRANSFORM = transforms.Compose(
+    [
+        transforms.ToTensor(),
+        transforms.Normalize(0.1307, 0.3081),
+
+    ]
+)
+
+
+def get_mnist(trainset_size: int = 10_000, testset_size: int = 1_000) -> tuple[Subset, Subset]:
+    """Returns a subset of MNIST training data."""
+
+    # Get original datasets, which are downloaded to "./data" for future use
+    mnist_trainset = datasets.MNIST(exercises_dir / "data", train=True, download=True, transform=MNIST_TRANSFORM)
+    mnist_testset = datasets.MNIST(exercises_dir / "data", train=False, download=True, transform=MNIST_TRANSFORM)
+
+    # Return a subset of the original datasets
+    mnist_trainset = Subset(mnist_trainset, indices=range(trainset_size))
+    mnist_testset = Subset(mnist_testset, indices=range(testset_size))
+
+    return mnist_trainset, mnist_testset
+
+
+mnist_trainset, mnist_testset = get_mnist()
+
+# DataLoader = batches + shuffles the dataset. Dataset gives 1 item; loader gives groups of 64.
+# shuffle=True for train (randomize order each epoch), False for test (order irrelevant).
+mnist_trainloader = DataLoader(mnist_trainset, batch_size=64, shuffle=True)
+mnist_testloader = DataLoader(mnist_testset, batch_size=64, shuffle=False)
+
+# Get the first batch of test data, by starting to iterate over `mnist_testloader`
+for img_batch, label_batch in mnist_testloader:
+    print(f"{img_batch.shape=}\n{label_batch.shape=}\n")
+    break
+
+# Get the first datapoint in the test set, by starting to iterate over `mnist_testset`
+for img, label in mnist_testset:
+    print(f"{img.shape=}\n{label=}\n")
+    break
+
+t.testing.assert_close(img, img_batch[0])
+assert label == label_batch[0].item()
+
+# %%
+device = t.device("mps" if t.backends.mps.is_available() else "cuda" if t.cuda.is_available() else "cpu")
+print(device)
+
+
+# %%
+model = SimpleMLP().to(device)
+
+# Number of samples in each batch
+batch_size = 128
+
+# An epoch is one complete pass through your entire training dataset
+epochs = 10
+
+mnist_trainset, _ = get_mnist()
+mnist_trainloader = DataLoader(mnist_trainset, batch_size=batch_size, shuffle=True)
+
+# The optimizer, this is what actually updates the weights. model.parameters() gives it all 
+# the trainable weights (this is why nn.Parameter mattered, so the optimizer can find them). 
+# Adam is a specific update algorithm (a smart version of gradient descent). lr=1e-3 is the 
+# learning rate, how big each update step is.
+optimizer = t.optim.Adam(model.parameters(), lr=1e-3)
+
+loss_list = []
+
+for epoch in range(epochs):
+
+    # pbar is tqdm(trainloader), the dataloader wrapped in a progress bar. Each inner 
+    # iteration gives one batch: imgs (128, 1, 28, 28) and labels (128,).
+    pbar = tqdm(mnist_trainloader)
+
+    for imgs, labels in pbar:
+        # Move data to device, perform forward pass
+        imgs, labels = imgs.to(device), labels.to(device)
+
+        # Feed the batch through the model, get predictions. logits are the raw output 
+        # scores, shape (128, 10), for each of 128 images, 10 scores (one per digit 0-9). 
+        # Calling model(imgs) runs the forward methods you built:
+        # (Flatten → Linear → ReLU → Linear)
+        logits = model(imgs)
+
+        # Calculate loss, perform backward pass
+        loss = F.cross_entropy(logits, labels)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+        # Update logs & progress bar
+        loss_list.append(loss.item())
+        pbar.set_postfix(epoch=f"{epoch + 1}/{epochs}", loss=f"{loss:.3f}")
+
+line(
+    loss_list,
+    x_max=epochs * len(mnist_trainset),
+    labels={"x": "Examples seen", "y": "Cross entropy loss"},
+    title="SimpleMLP training on MNIST",
+    width=700,
+)
+
+# %%
+print("cuda available:", t.cuda.is_available())   # ROCm reports as 'cuda' in torch
+print("device count:", t.cuda.device_count())
+print("device name:", t.cuda.get_device_name(0) if t.cuda.is_available() else "none")
+# %%
+
+# import time
+
+# def benchmark_matmul(N, iters=20, dtype=t.float16):
+#     a = t.randn(N, N, device=device, dtype=dtype)
+#     b = t.randn(N, N, device=device, dtype=dtype)
+
+#     for _ in range(5):          # shorter warmup
+#         c = a @ b
+#     t.cuda.synchronize()
+
+#     start = time.time()
+#     for _ in range(iters):
+#         c = a @ b
+#     t.cuda.synchronize()
+#     elapsed = time.time() - start
+
+#     tflops = 2 * N**3 * iters / elapsed / 1e12
+#     print(f"N={N:>6}  {str(dtype):>16}  {tflops:>7.1f} TFLOP/s  ({elapsed:.2f}s / {iters} iters)")
+#     return tflops
+
+# print("fp16:")
+# for N in [4096, 8192, 16384]:
+#     benchmark_matmul(N, dtype=t.float16)
+
+# print("\nbf16:")
+# for N in [4096, 8192, 16384]:
+#     benchmark_matmul(N, dtype=t.bfloat16)
+
+# print("\nfp32 (small size only, it's the slow path):")
+# benchmark_matmul(4096, dtype=t.float32)   # small N so it doesn't drag
+
+# print(f"\nPeak VRAM: {t.cuda.max_memory_allocated()/1e9:.1f}GB")
+
+# %%
+@dataclass
+class SimpleMLPTrainingArgs:
+    """
+    Defining this class implicitly creates an __init__ method, which sets arguments as below, e.g.
+    self.batch_size=64. Any of these fields can also be overridden when you create an instance, e.g.
+    SimpleMLPTrainingArgs(batch_size=128).
+    """
+
+    batch_size: int = 64
+    epochs: int = 20
+    learning_rate: float = 1e-3
+
+def train(args: SimpleMLPTrainingArgs) -> tuple[list[float], SimpleMLP]:
+    """
+    Trains the model, using training parameters from the `args` object.
+
+    Returns:
+        The model, and lists of loss & accuracy.
+    """
+
+    model = SimpleMLP().to(device)
+
+    mnist_trainset, mnist_testset = get_mnist()
+    mnist_trainloader = DataLoader(mnist_trainset, batch_size=args.batch_size, shuffle=True)
+    mnist_testloader = DataLoader(mnist_testset, batch_size=args.batch_size, shuffle=False)
+
+    optimizer = t.optim.Adam(model.parameters(), lr=args.learning_rate)
+    loss_list = []
+    accuracy_list = []
+    accuracy = 0.0
+
+    for epoch in range(args.epochs):
+        pbar = tqdm(mnist_trainloader)
+
+        for imgs, labels in pbar:
+            # Move data to device, perform forward pass
+            imgs, labels = imgs.to(device), labels.to(device)
+            logits = model(imgs)
+
+            # Calculate loss, perform backward pass
+            loss = F.cross_entropy(logits, labels)
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+            # Update logs & progress bar
+            loss_list.append(loss.item())
+            pbar.set_postfix(epoch=f"{epoch + 1}/{args.epochs}", loss=f"{loss:.3f}")
+
+        num_correct_classifications = 0
+        for imgs, labels in mnist_testloader:
+            imgs, labels = imgs.to(device), labels.to(device)
+            with t.inference_mode():
+                logits = model(imgs)
+
+            # Compute num correct by comparing argmaxed logits to true labels
+            predictions = t.argmax(logits, dim=1)
+            num_correct_classifications += (predictions == labels).sum().item()
+
+        # Compute & log total accuracy
+        accuracy = num_correct_classifications / len(mnist_testset)
+        accuracy_list.append(accuracy)
+
+    return loss_list, accuracy_list, model
+
+args = SimpleMLPTrainingArgs()
+loss_list, accuracy_list, model = train(args)
+
+line(
+    y=[loss_list, [0.1] + accuracy_list],  # we start by assuming a uniform accuracy of 10%
+    use_secondary_yaxis=True,
+    x_max=args.epochs * len(mnist_trainset),
+    labels={"x": "Num examples seen", "y1": "Cross entropy loss", "y2": "Test Accuracy"},
+    title="SimpleMLP training on MNIST",
+    width=800,
+)
+
+# %%
