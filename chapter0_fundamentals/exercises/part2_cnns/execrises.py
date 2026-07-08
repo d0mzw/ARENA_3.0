@@ -1,4 +1,7 @@
 # %%
+import os
+os.environ["HIPBLAS_WORKSPACE_CONFIG"] = ":4194304:8"   # 32GB
+
 import json
 import sys
 from collections import namedtuple
@@ -462,5 +465,423 @@ class MaxPool2d(nn.Module):
     def extra_repr(self) -> str:
         """Add additional information to the string representation of this class."""
         return ", ".join([f"{key}={getattr(self, key)}" for key in ["kernel_size", "stride", "padding"]])
+
+# %%
+class Sequential(nn.Module):
+    _modules: dict[str, nn.Module]
+
+    def __init__(self, *modules: nn.Module):
+        super().__init__()
+        for index, mod in enumerate(modules):
+            self._modules[str(index)] = mod
+
+    def __getitem__(self, index: int) -> nn.Module:
+        index %= len(self._modules)  # deal with negative indices
+        return self._modules[str(index)]
+
+    def __setitem__(self, index: int, module: nn.Module) -> None:
+        index %= len(self._modules)  # deal with negative indices
+        self._modules[str(index)] = module
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Chain each module together, with the output from one feeding into the next one."""
+        for mod in self._modules.values():
+            x = mod(x)
+        return x
+
+# %%
+
+class BatchNorm2d(nn.Module):
+
+    running_mean: Float[Tensor, " num_features"]
+    running_var: Float[Tensor, " num_features"]
+    num_batches_tracked: Int[Tensor, ""] 
+
+    def __init__(self, num_features: int, eps=1e-05, momentum=0.1):
+        """
+        Like nn.BatchNorm2d with track_running_stats=True and affine=True.
+
+        Name the learnable affine parameters `weight` and `bias` in that order.
+        """
+        super().__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.momentum = momentum
+
+        self.weight = nn.Parameter(t.ones(num_features))
+        self.bias = nn.Parameter(t.zeros(num_features))
+
+        self.register_buffer("running_mean", t.zeros(num_features))
+        self.register_buffer("running_var", t.ones(num_features))
+        self.register_buffer("num_batches_tracked", t.tensor(0))
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Normalize each channel.
+
+        Compute the variance using `torch.var(x, unbiased=False)`
+        Hint: you may also find it helpful to use the argument `keepdim`.
+
+        x: shape (batch, channels, height, width)
+        Return: shape (batch, channels, height, width)
+        """
+        
+        # Calculating mean and var over all dims except for the channel dim
+        
+        if self.training:
+            # Take mean over all dimensions except the feature dimension
+            mean = x.mean(dim=(0, 2, 3))
+
+            var = x.var(dim=(0, 2, 3), unbiased=False)
+            self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean
+            self.running_var = (1 - self.momentum) * self.running_var + self.momentum * var
+
+            self.num_batches_tracked += 1
+
+        else:
+            mean = self.running_mean
+            var = self.running_var
+
+        # Rearranging these so they can be broadcasted
+        reshape = lambda x: einops.rearrange(x, "channels -> 1 channels 1 1")
+
+        # Normalize, then apply affine transformation from self.weight & self.bias
+        x_normed = (x - reshape(mean)) / (reshape(var) + self.eps).sqrt()
+        x_affine = x_normed * reshape(self.weight) + reshape(self.bias)
+        return x_affine
+    
+
+    def extra_repr(self) -> str:
+        return f"num_features={self.num_features}, eps={self.eps}, momentum={self.momentum}"
+
+
+tests.test_batchnorm2d_module(BatchNorm2d)
+tests.test_batchnorm2d_forward(BatchNorm2d)
+tests.test_batchnorm2d_running_mean(BatchNorm2d)
+# %%
+class AveragePool(nn.Module):
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        x: shape (batch, channels, height, width)
+        Return: shape (batch, channels)
+        """
+        return t.mean(x, dim=(2, 3))
+
+# %%
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_feats: int, out_feats: int, first_stride=1):
+        """
+        A single residual block with optional downsampling.
+
+        For compatibility with the pretrained model, declare the left side branch first using a
+        `Sequential`.
+
+        If first_stride is > 1, this means the optional (conv + bn) should be present on the right
+        branch. Declare it second using another `Sequential`.
+        """
+        super().__init__()
+        is_shape_preserving = (first_stride == 1) and (in_feats == out_feats)  # determines if right branch is identity
+
+        self.left = Sequential(
+            Conv2d(in_feats, out_feats, kernel_size=3, stride=first_stride, padding=1),
+            BatchNorm2d(out_feats),
+            ReLU(),
+            Conv2d(out_feats, out_feats, kernel_size=3, stride=1, padding=1),
+            BatchNorm2d(out_feats),
+        )
+
+        self.right = (
+            nn.Identity()
+            if is_shape_preserving  # Leave x unchanged
+            else Sequential(        # Down sample x
+                Conv2d(in_feats, out_feats, kernel_size=1, stride=first_stride),
+                BatchNorm2d(out_feats),
+            )
+        )
+
+        self.relu = ReLU()
+
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Compute the forward pass. If no downsampling block is present, the addition should just add
+        the left branch's output to the input.
+
+        x: shape (batch, in_feats, height, width)
+
+        Return: shape (batch, out_feats, height / stride, width / stride)
+        """
+
+        # A residual block computes: output = F(x) + x
+        #
+        # It does two things with the input x:
+        #   1. Transforms it through some layers, call this F(x).
+        #   2. Keeps the original x unchanged (the "skip connection").
+        #
+        # Then it adds them together: F(x) + x
+
+        x_left = self.left(x)       # F(x): the transformed version
+        x_right = self.right(x)     # x: the skip connection
+        return self.relu(x_left + x_right)  # add them, then relu
+
+
+tests.test_residual_block(ResidualBlock)
+
+# %%
+
+class BlockGroup(nn.Module):
+    def __init__(self, n_blocks: int, in_feats: int, out_feats: int, first_stride=1):
+        """
+        An n_blocks-long sequence of ResidualBlock where only the first block uses the provided
+        stride.
+        """
+        super().__init__()
+        
+        blocks = [ResidualBlock(in_feats, out_feats, first_stride)]
+        for _ in range(n_blocks - 1):
+            blocks.append(ResidualBlock(out_feats, out_feats))
+
+        self.blocks = Sequential(*blocks)
+
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Compute the forward pass.
+
+        x: shape (batch, in_feats, height, width)
+
+        Return: shape (batch, out_feats, height / first_stride, width / first_stride)
+        """
+        return self.blocks(x)
+
+
+tests.test_block_group(BlockGroup)
+
+# %%
+class ResNet34(nn.Module):
+    def __init__(
+        self,
+        n_blocks_per_group=[3, 4, 6, 3],            # residual blocks per group
+        out_features_per_group=[64, 128, 256, 512], # output channel count for each of the 4 groups
+        first_strides_per_group=[1, 2, 2, 2],       # stride of each group's first block
+        n_classes=1000,                             # output classes (1000 = ImageNet)
+    ):
+        super().__init__()
+        out_feats0 = 64     # channels produced by the input stem, feeds group 0
+
+        self.n_blocks_per_group = n_blocks_per_group
+        self.out_features_per_group = out_features_per_group
+        self.first_strides_per_group = first_strides_per_group
+        self.n_classes = n_classes
+
+        self.in_layers = Sequential(
+            Conv2d(3, out_feats0, kernel_size=7, stride=2, padding=3),
+            BatchNorm2d(out_feats0),
+            ReLU(),
+            MaxPool2d(kernel_size=3, stride=2, padding=1),
+        )
+
+        # Each group is a stack of ResidualBlocks; the first block in a group handles the
+        # channel change + downsample, the rest refine at that shape
+        residual_layers = []
+        for i in range(len(n_blocks_per_group)):
+            residual_layers.append(
+                BlockGroup(
+                    n_blocks=n_blocks_per_group[i],                 # how many blocks in this group
+
+                    # in_feats = previous group's out_feats (64 from the stem for group 0).
+                    # Prepending 64 -> [64,64,128,256,512]; index i picks this group's input width.
+                    in_feats=[64, *self.out_features_per_group][i], 
+
+                    out_feats=self.out_features_per_group[i],       # this group's output width
+                    first_stride=self.first_strides_per_group[i],   # group's downsample stride (1 or 2)
+                )
+            )
+        self.residual_layers = Sequential(*residual_layers)
+
+        self.out_layers = Sequential(
+            AveragePool(),
+            Linear(out_features_per_group[-1], n_classes),
+        )
+
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        x: shape (batch, channels, height, width)
+        Return: shape (batch, n_classes)
+        """
+        post_first_conv_block = self.in_layers(x)
+        post_block_groups = self.residual_layers(post_first_conv_block)
+        logits = self.out_layers(post_block_groups)
+        return logits
+
+my_resnet = ResNet34()
+
+# (1) Test via helper function `print_param_count`
+target_resnet = models.resnet34()  # without supplying a `weights` argument, we just initialize with random weights
+utils.print_param_count(my_resnet, target_resnet)
+
+# (2) Test via `torchinfo.summary`
+print("My model:", torchinfo.summary(my_resnet, input_size=(1, 3, 64, 64)), sep="\n")
+print(
+    "\nReference model:",
+    torchinfo.summary(target_resnet, input_size=(1, 3, 64, 64), depth=2),
+    sep="\n",
+)
+
+# %%
+
+def copy_weights(my_resnet: ResNet34, pretrained_resnet: models.resnet.ResNet) -> ResNet34:
+    """Copy over the weights of `pretrained_resnet` to your resnet."""
+
+    # Get the state dictionaries for each model, check they have the same number of parameters &
+    # buffers
+    mydict = my_resnet.state_dict()
+    pretraineddict = pretrained_resnet.state_dict()
+    assert len(mydict) == len(pretraineddict), "Mismatching state dictionaries."
+
+    # Define a dictionary mapping the names of your parameters / buffers to their values in the
+    # pretrained model
+    state_dict_to_load = {
+        mykey: pretrainedvalue
+        for (mykey, myvalue), (pretrainedkey, pretrainedvalue) in zip(mydict.items(), pretraineddict.items())
+    }
+
+    # Load in this dictionary to your model
+    my_resnet.load_state_dict(state_dict_to_load)
+
+    return my_resnet
+
+
+pretrained_resnet = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1).to(device)
+my_resnet = copy_weights(my_resnet, pretrained_resnet).to(device)
+print("Weights copied successfully!")
+
+# %%
+IMAGE_FILENAMES = [
+    "chimpanzee.jpg",
+    "golden_retriever.jpg",
+    "platypus.jpg",
+    "frogs.jpg",
+    "fireworks.jpg",
+    "astronaut.jpg",
+    "iguana.jpg",
+    "volcano.jpg",
+    "goofy.jpg",
+    "dragonfly.jpg",
+]
+
+IMAGE_FOLDER = section_dir / "resnet_inputs"
+
+images = [Image.open(IMAGE_FOLDER / filename) for filename in IMAGE_FILENAMES]
+
+# %%
+display(images[0])
+
+# %%
+IMAGE_SIZE = 224
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
+IMAGENET_TRANSFORM = transforms.Compose(
+    [
+        transforms.ToTensor(),
+        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+    ]
+)
+
+prepared_images = t.stack([IMAGENET_TRANSFORM(img) for img in images], dim=0).to(device)
+assert prepared_images.shape == (len(images), 3, IMAGE_SIZE, IMAGE_SIZE)
+
+# %%
+@t.inference_mode()
+def predict(
+    model: nn.Module, images: Float[Tensor, "batch rgb h w"]
+) -> tuple[Float[Tensor, " batch"], Int[Tensor, " batch"]]:
+    """
+    Returns the maximum probability and predicted class for each image, as a tensor of floats and
+    ints respectively.
+    """
+    model.eval()
+    logits = model(images)
+    probabilities = logits.softmax(dim=-1)
+    return probabilities.max(dim=-1)
+
+
+with open(section_dir / "imagenet_labels.json") as f:
+    imagenet_labels = list(json.load(f).values())
+
+# Check your predictions match those of the pretrained model
+my_probs, my_predictions = predict(my_resnet, prepared_images)
+pretrained_probs, pretrained_predictions = predict(pretrained_resnet, prepared_images)
+assert (my_predictions == pretrained_predictions).all()
+t.testing.assert_close(my_probs, pretrained_probs, atol=5e-4, rtol=0)  # tolerance of 0.05%
+print("All predictions match!")
+
+# Print out your predictions, next to the corresponding images
+for i, img in enumerate(images):
+    table = Table("Model", "Prediction", "Probability")
+    table.add_row("My ResNet", imagenet_labels[my_predictions[i]], f"{my_probs[i]:.3%}")
+    table.add_row(
+        "Reference Model",
+        imagenet_labels[pretrained_predictions[i]],
+        f"{pretrained_probs[i]:.3%}",
+    )
+    rprint(table)
+    display(img)
+
+# %%
+class NanModule(nn.Module):
+    """
+    Define a module that always returns NaNs (we will use hooks to identify this error).
+    """
+
+    def forward(self, x):
+        return t.full_like(x, float("nan"))
+
+
+def hook_check_for_nan_output(module: nn.Module, input: tuple[Tensor], output: Tensor) -> None:
+    """
+    Hook function which detects when the output of a layer is NaN.
+    """
+    if t.isnan(output).any():
+        raise ValueError(f"NaN output from {module}")
+
+
+def add_hook(module: nn.Module) -> None:
+    """
+    Register our hook function in a module.
+
+    Use model.apply(add_hook) to recursively apply the hook to model and all submodules.
+    """
+    module.register_forward_hook(hook_check_for_nan_output)
+
+
+def remove_hooks(module: nn.Module) -> None:
+    """
+    Remove all hooks from module.
+
+    Use module.apply(remove_hooks) to do this recursively.
+    """
+    module._backward_hooks.clear()
+    module._forward_hooks.clear()
+    module._forward_pre_hooks.clear()
+
+
+# Create our model with a NaN in the middle, and apply a hook fn to it which checks for NaNs
+model = nn.Sequential(nn.Identity(), NanModule(), nn.Identity())
+model = model.apply(add_hook)
+
+# Run the model, and our hook function should raise an error that gets caught by the try-except
+try:
+    input = t.randn(3)
+    output = model(input)
+except ValueError as e:
+    print(e)
+
+# Remove hooks at the end
+model = model.apply(remove_hooks)
 
 # %%
